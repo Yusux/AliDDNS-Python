@@ -25,4 +25,4 @@
 - ResourceRecords: 需要修改的域名
 - UseDingTalk: 是否使用钉钉通知
 - DingTalkAccessToken: 钉钉机器人的 AccessToken
-- DingTalkSecret: 钉钉机器人的 Secret
+- DingTalkSecret: 钉钉机器人的 Secret，如果不使用则设置为 `None`

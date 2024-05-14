@@ -9,6 +9,7 @@ import json
 import ipaddress
 import logging
 import config
+from config import ResourceRecord
 from dingtalk_utils import dingtalk
 
 def getIPv4():
@@ -62,23 +63,63 @@ def getRecords(client, rr, domain):
     jsonData = json.loads(response)
     return jsonData['DomainRecords']['Record']
 
-def post_dingtalk(text):
+def post_dingtalk(rrs: list[ResourceRecord]):
     """
     Post message to DingTalk in text format
-    - title: title of the message
-    - text: text of the message
+    - rrs: resource records
     """
+    ipv4_text = ""
+    ipv6_text = ""
+    for rr in rrs:
+        if rr.success:
+            if rr.result is None:
+                continue
+            text = f"Update Result: Success\n  - Domain: {rr.rr}.{rr.domain}\n  - New IP: {rr.result}\n"
+            if rr.type == "A":
+                # If ipv4_text has some content, add a new divider
+                if ipv4_text != "":
+                    ipv4_text += "------------------\n"
+                ipv4_text += text
+            elif rr.type == "AAAA":
+                # If ipv6_text has some content, add a new divider
+                if ipv6_text != "":
+                    ipv6_text += "------------------\n"
+                ipv6_text += text
+        else:
+            text = f"Update Result: Failed\n  - Domain: {rr.rr}.{rr.domain}\n  - Error: {rr.result}\n"
+            if rr.type == "A":
+                # If ipv4_text has some content, add a new divider
+                if ipv4_text != "":
+                    ipv4_text += "------------------\n"
+                ipv4_text += text
+            elif rr.type == "AAAA":
+                # If ipv6_text has some content, add a new divider
+                if ipv6_text != "":
+                    ipv6_text += "------------------\n"
+                ipv6_text += text
+    # If both ipv4_text and ipv6_text are empty, no need to send message to DingTalk
+    if ipv4_text == "" and ipv6_text == "":
+        logging.info("No record updated, no need to send message to DingTalk")
+        return
+    # Send message to DingTalk
+    body_text = f"#### Aliyun DDNS Update\n"
+    if ipv4_text != "":
+        body_text += f"##### ====== IPv4 ======\n{ipv4_text}\n"
+    if ipv6_text != "":
+        body_text += f"##### ====== IPv6 ======\n{ipv6_text}\n"
+    body_text += "##### === AliyunDDNS ===\n"
     if config.UseDingTalk:
         ding = dingtalk()
         send_body = {
-            "msgtype": "text",
-            "text": {
-                "content": text
+            "msgtype": "markdown",
+            "markdown": {
+                "title": "Aliyun DDNS Update",
+                "text": body_text
             }
         }
         ding.post(send_body)
 
-def addDomainRecord(client,rr,domain,type,ip):
+def addDomainRecord(client, rr, domain, type, ip):
     """
     Add a record to a domain
     - client: Aliyun client
@@ -86,7 +127,6 @@ def addDomainRecord(client,rr,domain,type,ip):
     - domain: domain
     - type: record type
     - ip: IP address
-    - return: record id
     """
     request = AddDomainRecordRequest()
     request.set_action_name("AddDomainRecord")
@@ -96,9 +136,8 @@ def addDomainRecord(client,rr,domain,type,ip):
     request.set_Type(type)
     request.set_Value(ip)
     request.set_TTL(600)
-    response = client.do_action_with_exception(request)
+    _ = client.do_action_with_exception(request)
     logging.info(f"Add record: {rr}.{domain} -> {ip}")
-    return json.loads(response)['RecordId']
 
 def updateDomainRecord(client, rr, domain, record_id, type, ip):
     """
@@ -109,7 +148,6 @@ def updateDomainRecord(client, rr, domain, record_id, type, ip):
     - record_id: record id
     - type: record type
     - ip: IP address
-    - return: record id
     """
     request = UpdateDomainRecordRequest()
     request.set_action_name("UpdateDomainRecord")
@@ -119,21 +157,20 @@ def updateDomainRecord(client, rr, domain, record_id, type, ip):
     request.set_Type(type)
     request.set_Value(ip)
     request.set_TTL(600)
-    response = client.do_action_with_exception(request)
+    _ = client.do_action_with_exception(request)
     logging.info(f"Update record: {rr}.{domain} -> {ip}")
-    return json.loads(response)['RecordId']
 
-def maintainDomainRecord(client, rr, domain, type, ip):
+def maintainDomainRecord(client, record: ResourceRecord, ip):
     """
     Maintain a record of a domain
     - client: Aliyun client
-    - rr: resource record
-    - domain: domain
-    - type: record type
+    - record: resource record
     - ip: IP address
-    - return: record id
     """
-    records = getRecords(client,rr,domain)
+    rr     = record.rr
+    domain = record.domain
+    type   = record.type
+    records = getRecords(client, rr, domain)
     record_id=None
     for record in records:
         if (
@@ -146,21 +183,19 @@ def maintainDomainRecord(client, rr, domain, type, ip):
             break
     if record_id is None:
         logging.info(f"Record not found, adding record: {rr}.{domain} -> {ip}")
-        record_id = addDomainRecord(client,rr,domain,ip,type)
-        post_dingtalk(
-            f"Record not found, adding record: {rr}.{domain} -> {ip}"
-        )
+        addDomainRecord(client, rr, domain, ip, type)
+        record.success = True
+        record.result = ip
     else:
         logging.info(f"Record found: {rr}.{domain} -> {avail_ip}")
         if avail_ip == ip:
             logging.info(f"IP not changed, no need to update record: {avail_ip}")
+            record.success = True
         else:
             logging.info(f"IP changed, updating record: {avail_ip} -> {ip}")
-            record_id = updateDomainRecord(client,rr,domain,record_id,type,ip)
-            post_dingtalk(
-                f"IP changed, updating record of {rr}.{domain} from {avail_ip} to {ip}"
-            )
-    return record_id
+            updateDomainRecord(client,rr,domain,record_id,type,ip)
+            record.success = True
+            record.result = ip
 
         
 if __name__ == "__main__":
@@ -172,30 +207,24 @@ if __name__ == "__main__":
 
     # Maintain all records
     for record in config.ResourceRecords:
-        rr     = record.rr
-        domain = record.domain
-        type   = record.type
-
         # Get IP address
-        if type == "A":
-            try:
+        try: 
+            if record.type == "A":
                 ip = getIPv4()
-            except Exception as e:
-                logging.error(f"Failed to get IPv4 address for {str(record)}: {str(e)}")
-                continue
-        elif type == "AAAA":
-            try:
+            elif record.type == "AAAA":
                 ip = getIPv6()
-            except Exception as e:
-                logging.error(f"Failed to get IPv6 address for {str(record)}: {str(e)}")
-                continue
-        else:
-            logging.error(f"Invalid record type: {type} in {str(record)}")
-            continue
+            else:
+                # Invalid type
+                raise ValueError(f"Invalid record type: {record.type}")
 
-        # Maintain record
-        try:
-            maintainDomainRecord(client, rr, domain, type, ip)
+            # Maintain record
+            maintainDomainRecord(client, record, ip)
+        
         except Exception as e:
-            logging.error(f"Failed to maintain record {str(record)}: {str(e)}")
+            logging.error(f"Failed for {str(record)}: {str(e)}")
+            record.success = False
+            record.result = str(e)
             continue
+    
+    # Post message to DingTalk
+    post_dingtalk(config.ResourceRecords)
